@@ -1,115 +1,100 @@
 #!/bin/bash
 
-# Tested on: AWS, Ubuntu 22.04 LTS
-# Works on: 
+# Purpose: To automate the running of the Spring Boot App
+# Tested on: AWS, Ubuntu 22.04 LTS 
+# Works on: multiple VMs, multiple times
 # Tested by:  Lauren Copas 
-# Date Tested on: 
+# Date Tested on: 23/10/2025
 
-echo Update...
-sudo apt-get update
-echo Done!
-echo
+GITHUB_TOKEN="ghpxxxxxx"
+REPO_OWNER="laurenksmith"
+REPO_NAME="library-java17-mysql-app"
+BRANCH=""
+DB_HOST="PASTE DP PRIVATE IP ADDRESS HERE"
 
-# upgrade 
-echo Upgrade...
-sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y
-echo Done!
-echo
+set -euxo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
 
-# install nginx
-echo Install nginx...
-sudo DEBIAN_FRONTEND=noninteractive apt install nginx -y
-echo Done!
-echo
+apt-get update
+apt-get -y install openjdk-17-jdk maven git ca-certificates mysql-client-core-8.0 netcat
 
-# configure nginx
-echo Restart nginx...
-sudo systemctl restart nginx
-echo Done!
-echo
+APP_DB="library"
+APP_USER="appuser"
+APP_PASS="StrongPass123!"
+APP_PORT=5000
 
-# Ensure curl is present for NodeSource (harmless if already installed)
-echo Ensure curl is installed...
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y curl
-echo Done!
-echo
+for i in $(seq 1 60); do
+  nc -z "${DB_HOST}" 3306 && echo "[APP] DB TCP reachable." && break || true
+  sleep 2
+  [ "$i" -eq 60 ] && { echo "[APP] DB not reachable"; exit 20; }
+done
 
-# Download script
-echo Download script to update things to install node js v20...
-curl -sL https://deb.nodesource.com/setup_20.x -o nodesource_setup.sh
-echo Done!
-echo
+for i in $(seq 1 40); do
+  mysqladmin ping -h "${DB_HOST}" -u"${APP_USER}" -p"${APP_PASS}" --silent && echo "[APP] DB auth OK." && break || true
+  sleep 2
+  [ "$i" -eq 40 ] && { echo "[APP] DB auth failed"; exit 21; }
+done
 
-# Update things prior to installing node js v20
-echo Run script to update things to install node js v20...
-sudo DEBIAN_FRONTEND=noninteractive bash nodesource_setup.sh
-echo Done!
-echo
+APP_SRC="/opt/library-src"
+APP_DIR="/opt/library-app"
+mkdir -p "$APP_SRC" "$APP_DIR"
+cd "$APP_SRC"
+rm -rf repo || true
 
-# Install node js v20
-echo Install node js v20...
-sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs
-echo Done!
-echo
+for i in $(seq 1 10); do
+  if git clone --depth 1 "https://${GITHUB_TOKEN}:x-oauth-basic@github.com/${REPO_OWNER}/${REPO_NAME}.git" repo; then
+    break
+  fi
+  echo "[APP] git clone attempt $i failed; retrying..."
+  sleep 5
+  [ "$i" -eq 10 ] && exit 30
+done
+GITHUB_TOKEN=""
 
-# Use the CURRENT folder (User Data runs as root; working dir is "/")
-WORKDIR="$(pwd)"
-echo "Working directory is: $WORKDIR"
-echo
+cd repo
+if [ -n "$BRANCH" ]; then git checkout -q "$BRANCH" || true; else
+  DEF="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+  [ -n "$DEF" ] && git checkout -q "$DEF" || true
+fi
 
-# get app code using a git clone
-echo Get app code from GitHub...
-git clone https://github.com/laurenksmith/library-java17-mysql-app.git "$WORKDIR/libraryproject2" || true
-echo Done! 
-echo
+POM_DIR="$(dirname "$(find . -maxdepth 3 -type f -name 'pom.xml' | head -n1)")"
+[ -n "$POM_DIR" ] || { echo "[APP] No pom.xml found"; exit 31; }
+echo "[APP] Using Maven project at: $POM_DIR"
+cd "$POM_DIR"
 
-# cd into app folder
-echo Moving into app directory...
-cd "$WORKDIR/library-java17-mysql-app/LibraryProject2"
-echo Done!
-echo
+mvn -q -DskipTests package
 
-# Connect database to app - MAKE SURE TO UPDATE THE DATABASE IP ADDRESS
-echo Connecting to the database...
-export DB_HOST="mongodb://3.254.231.201:27017/posts"
-echo Done!
-echo
+JAR_PATH="$(ls -1 target/*.jar | head -n1)"
+[ -f "$JAR_PATH" ] || { echo "[APP] No JAR produced"; exit 32; }
+cp "$JAR_PATH" "$APP_DIR/library.jar"
 
-# run npm install
-echo Installing dependencies...
-npm install
-echo Done!
-echo
+cat >/etc/systemd/system/library.service <<EOF
+[Unit]
+Description=Library App
+After=network-online.target
+Wants=network-online.target
 
-# install pm2
-echo Installing PM2...
-sudo npm install -g pm2
-echo Done!
-echo
+[Service]
+Type=simple
+Environment=DB_HOST=${DB_HOST}
+Environment=DB_NAME=${APP_DB}
+Environment=DB_USER=${APP_USER}
+Environment=DB_PASS=${APP_PASS}
+ExecStart=/usr/bin/java -jar ${APP_DIR}/library.jar \
+  --server.port=${APP_PORT} \
+  --spring.datasource.url=jdbc:mysql://\${DB_HOST}:3306/\${DB_NAME} \
+  --spring.datasource.username=\${DB_USER} \
+  --spring.datasource.password=\${DB_PASS}
+Restart=always
 
-# Stop if app still running
-echo Stopping any existing pm2 process...
-pm2 stop app || true
-echo Done!
-echo
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# run app in the background with pm2
-echo Starting up the app...
-pm2 start app.js --name app --update-env
-echo Done!
-echo
+systemctl daemon-reload
+systemctl enable --now library
 
-# Reverse Proxy
-# back up first (overwrites backup each time)
-sudo cp /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
-echo Removing need to port to port 3000....
-# Replace only the try_files line INSIDE the location block with proxy_pass
-sudo sed -i 's|^\s*try_files\s\+\$uri\s\+\$uri/\s\+=404;|proxy_pass http://localhost:3000;|' /etc/nginx/sites-available/default
-echo Done!
-echo
-
-# configure nginx
-echo Restart nginx...
-sudo systemctl restart nginx
-echo Done!
-echo
+sleep 3
+ss -ltnp | grep ":${APP_PORT}" || true
+curl -sSf "http://localhost:${APP_PORT}/web/authors" | head -c 200 || true
